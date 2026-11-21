@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  mlr 一键安装器
-#    curl -fsSL https://raw.githubusercontent.com/yourname/mihomo-relay/main/install.sh | sudo bash
+#    curl -fsSL https://raw.githubusercontent.com/WOCE/mihomo-me/main/install.sh | sudo bash
 #  或仓库内：sudo bash install.sh
 #  安装后命令：mlr （进入交互菜单）
 # ==============================================================================
 set -euo pipefail
 
-RAW="${MLR_RAW:-https://raw.githubusercontent.com/yourname/mihomo-relay/main}"
+RAW="${MLR_RAW:-https://raw.githubusercontent.com/WOCE/mihomo-me/main}"
 DEST="${MLR_DEST:-/usr/local/bin/mlr}"
 NO_RUN="${MLR_NO_RUN:-0}"
 

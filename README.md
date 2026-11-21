@@ -25,7 +25,7 @@
 
 ```bash
 # 一条命令装完并直接进菜单
-curl -fsSL https://raw.githubusercontent.com/yourname/mihomo-relay/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/WOCE/mihomo-me/main/install.sh | sudo bash
 ```
 
 装完 `mlr` 就是全局命令，以后任何时候敲 `sudo mlr` 即可回到菜单：
