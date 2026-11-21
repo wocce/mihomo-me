@@ -9,7 +9,7 @@ set -uo pipefail
 export LC_ALL=C.UTF-8
 
 MLR_VERSION="0.1.0"
-MLR_REPO="${MLR_REPO:-WOCE/mihomo-me}"
+MLR_REPO="${MLR_REPO:-wocce/mihomo-me}"
 MLR_RAW="${MLR_RAW:-https://raw.githubusercontent.com/${MLR_REPO}/main}"
 
 ETC="${MLR_ETC:-/etc/mihomo}"
