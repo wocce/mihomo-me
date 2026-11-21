@@ -1,0 +1,1272 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  mlr - Mihomo 中转 / 落地 一键管理工具
+#  场景：仅 IPv6 公网的国内线路机（如利群 cnc / 各种 v6-only VPS）作为入口，
+#        出口可选「本机直出」或「指定落地机」，入口可选 v6直连 / IPv4 NAT / 自有v4中转。
+#  License: MIT
+# ==============================================================================
+set -uo pipefail
+export LC_ALL=C.UTF-8
+
+MLR_VERSION="0.1.0"
+MLR_REPO="${MLR_REPO:-yourname/mihomo-relay}"
+MLR_RAW="${MLR_RAW:-https://raw.githubusercontent.com/${MLR_REPO}/main}"
+
+ETC="${MLR_ETC:-/etc/mihomo}"
+CFG="$ETC/config.yaml"
+STATE="$ETC/mlr.state"
+BK="$ETC/backup"
+BIN="${MLR_BIN:-/usr/local/bin/mihomo}"
+SVC="mihomo"
+DRY="${MLR_DRY:-0}"
+
+C_RESET=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_C=$'\033[36m'
+
+declare -A ST=()
+c=""          # 菜单选择共用变量
+
+# ---------------------------------------------------------------- 基础输出 ----
+hr() { printf '%s\n' "============================================================"; }
+ok()   { printf '%s[ OK ]%s %s\n' "$C_G" "$C_RESET" "$*"; }
+info() { printf '%s[ .. ]%s %s\n' "$C_C" "$C_RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$C_Y" "$C_RESET" "$*"; }
+err()  { printf '%s[FAIL]%s %s\n' "$C_R" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+pause(){ printf '\n按回车继续...'; read -r _ || true; }
+
+need_root() {
+  [ "$DRY" = "1" ] && return 0
+  [ "$(id -u)" = "0" ] || die "请用 root 运行：sudo $0"
+}
+
+# ---------------------------------------------------------------- 状态存储 ----
+st_get() { printf '%s' "${ST[$1]:-${2:-}}"; }
+st_set() { ST["$1"]="$2"; }
+
+st_load() {
+  [ -f "$STATE" ] || return 0
+  # 只接受 KEY=VALUE 形式，避免任意代码执行
+  while IFS='=' read -r k v; do
+    k="${k// /}"
+    [[ "$k" =~ ^[A-Z][A-Z0-9_]*$ ]] || continue
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    ST["$k"]="$v"
+  done < "$STATE"
+}
+
+st_save() {
+  [ "$DRY" = "1" ] && return 0
+  mkdir -p "$ETC"
+  local tmp="$STATE.tmp" k esc
+  : > "$tmp"
+  for k in "${!ST[@]}"; do
+    esc="${ST[$k]//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    printf '%s="%s"\n' "$k" "$esc" >> "$tmp"
+  done
+  mv -f "$tmp" "$STATE"
+  chmod 600 "$STATE"
+}
+
+# ---------------------------------------------------------------- 环境探测 ----
+det_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l)        echo armv7 ;;
+    *)             echo unknown ;;
+  esac
+}
+
+det_v6() {
+  ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+det_v4_local() {
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+# 本机能否主动出网（v4 / v6）
+probe_egress4() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -4 -fsS --max-time 6 https://api-ipv4.ip.sb/ip 2>/dev/null | tr -d '[:space:]'
+}
+
+probe_egress6() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -6 -fsS --max-time 6 https://api-ipv6.ip.sb/ip 2>/dev/null | tr -d '[:space:]'
+}
+
+os_id() { [ -r /etc/os-release ] && . /etc/os-release && printf '%s' "${ID:-unknown}" || echo unknown; }
+
+pkg_install() {
+  [ "$DRY" = "1" ] && { info "DRY: 跳过安装 $*"; return 0; }
+  case "$(os_id)" in
+    debian|ubuntu)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq >/dev/null 2>&1 || true
+      apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
+    alpine) apk add --no-cache "$@" >/dev/null 2>&1 ;;
+    centos|rhel|rocky|almalinux|fedora) dnf install -y -q "$@" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- 输入助手 ----
+ask() { # ask <变量名> <提示> <默认值>
+  local var="$1" prompt="$2" def="${3:-}" ans=""
+  if [ -n "$def" ]; then
+    printf '%s %s %s[%s]%s: ' "$C_C" "$prompt" "$C_DIM" "$def" "$C_RESET" >&2
+  else
+    printf '%s %s%s: ' "$C_C" "$prompt" "$C_RESET" >&2
+  fi
+  read -r ans || ans=""
+  [ -z "$ans" ] && ans="$def"
+  printf -v "$var" '%s' "$ans"
+}
+
+ask_port() { # ask_port <变量名> <提示> <默认值>
+  local var="$1" prompt="$2" def="${3:-}" ans
+  while :; do
+    ask ans "$prompt" "$def"
+    if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le 65535 ]; then
+      printf -v "$var" '%s' "$ans"; return 0
+    fi
+    err "端口必须是 1-65535 的整数"
+  done
+}
+
+confirm() { # confirm <提示> [默认Y]
+  local p="$1" d="${2:-Y}" a=""
+  printf '%s %s %s[%s]%s: ' "$C_Y" "$p" "$C_DIM" "$d" "$C_RESET" >&2
+  read -r a || a=""
+  a="${a:-$d}"
+  case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+yaml_q() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"; }
+
+# ------------------------------------------------------------ mihomo 二进制 ----
+mihomo_latest_tag() {
+  curl -fsSLI --max-time 12 "https://github.com/MetaCubeX/mihomo/releases/latest" 2>/dev/null \
+    | tr -d '\r' | sed -n 's#^[Ll]ocation:.*/tag/\(.*\)$#\1#p' | tail -1
+}
+
+mihomo_asset() { # mihomo_asset <tag> <arch>
+  local tag="$1" arch="$2" suffix=""
+  [ "$arch" = "amd64" ] && suffix="-compatible"
+  printf 'mihomo-linux-%s%s-%s.gz' "$arch" "$suffix" "$tag"
+}
+
+# shellcheck disable=SC2120  # 可选传入 tag
+mihomo_install_bin() {
+  local arch tag asset url tmp
+  arch="$(det_arch)"
+  [ "$arch" = "unknown" ] && die "不支持的 CPU 架构：$(uname -m)"
+  tag="${1:-$(mihomo_latest_tag)}"
+  [ -n "$tag" ] || die "无法获取 mihomo 最新版本（检查网络）"
+  asset="$(mihomo_asset "$tag" "$arch")"
+  url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${asset}"
+  tmp="$(mktemp -d)"
+  info "下载 mihomo ${tag} (${arch})"
+  if ! curl -fL --retry 3 --max-time 180 -o "$tmp/m.gz" "$url" 2>/dev/null; then
+    for m in "https://ghfast.top/${url}" "https://gh-proxy.com/${url}" "https://ghproxy.net/${url}"; do
+      warn "直连失败，尝试镜像：${m%%/https*}"
+      if curl -fL --retry 2 --max-time 180 -o "$tmp/m.gz" "$m" 2>/dev/null; then break; fi
+    done
+  fi
+  [ -s "$tmp/m.gz" ] || { rm -rf "$tmp"; die "mihomo 下载失败，请检查网络或代理"; }
+  gunzip -f "$tmp/m.gz" || { rm -rf "$tmp"; die "解压失败"; }
+  chmod +x "$tmp/m"
+  if [ "$DRY" = "1" ]; then
+    info "DRY: 将安装到 $BIN"; BIN="$tmp/m"; return 0
+  fi
+  install -m 755 "$tmp/m" "$BIN"
+  rm -rf "$tmp"
+  ok "$("$BIN" -v | head -1)"
+}
+
+mihomo_ensure() {
+  if [ -x "$BIN" ]; then return 0; fi
+  local cand
+  for cand in /usr/local/bin/mihomo /usr/bin/mihomo /opt/mihomo/mihomo; do
+    [ -x "$cand" ] && { BIN="$cand"; return 0; }
+  done
+  warn "未检测到 mihomo，开始安装"
+  mihomo_install_bin || return 1
+}
+
+svc_write_unit() {
+  [ "$DRY" = "1" ] && return 0
+  cat > "/etc/systemd/system/${SVC}.service" <<EOF
+[Unit]
+Description=mihomo proxy service (managed by mlr)
+Documentation=https://github.com/MetaCubeX/mihomo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${BIN} -d ${ETC}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$SVC" >/dev/null 2>&1 || true
+}
+
+svc_active() { [ "$DRY" = "1" ] && return 0; systemctl is-active --quiet "$SVC"; }
+
+svc_restart() {
+  [ "$DRY" = "1" ] && { info "DRY: 跳过 systemctl restart"; return 0; }
+  systemctl restart "$SVC"
+  sleep 2
+  if ! svc_active; then
+    err "服务启动失败，最近日志："
+    journalctl -u "$SVC" -n 25 --no-pager 2>/dev/null | tail -25
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------ 密钥/参数生成 ----
+gen_uuid() {
+  if [ -x "$BIN" ]; then "$BIN" generate uuid 2>/dev/null; else
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || printf '%s' "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+  fi
+}
+
+gen_ss_pass() { # $1 = 2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm
+  local bits=256
+  case "$1" in *aes-128-gcm) bits=128 ;; *chacha20*) bits=256 ;; esac
+  if [ -x "$BIN" ]; then "$BIN" generate ss-password "$bits" 2>/dev/null; else
+    head -c "$((bits/8))" /dev/urandom | base64 | tr -d '\n'
+  fi
+}
+
+gen_reality() { # 输出 REALITY_PRIV / REALITY_PUB
+  local out
+  if [ -x "$BIN" ]; then
+    out="$("$BIN" generate reality-keypair 2>/dev/null)"
+    st_set REALITY_PRIV "$(printf '%s\n' "$out" | sed -n 's/^PrivateKey: *//p')"
+    st_set REALITY_PUB  "$(printf '%s\n' "$out" | sed -n 's/^PublicKey: *//p')"
+  else
+    die "需要 mihomo 二进制来生成 Reality 密钥对"
+  fi
+  st_set REALITY_SID "$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+}
+
+gen_vlessenc() { # 输出 VENC_SERVER(decryption) / VENC_CLIENT(encryption)
+  local out priv pass
+  [ -x "$BIN" ] || die "需要 mihomo 二进制来生成 VLESS Encryption 参数"
+  out="$("$BIN" generate vless-x25519 2>/dev/null)"
+  priv="$(printf '%s\n' "$out" | sed -n 's/^PrivateKey: *//p' | head -1)"
+  pass="$(printf '%s\n' "$out" | sed -n 's/^Password: *//p' | head -1)"
+  [ -n "$priv" ] && [ -n "$pass" ] || die "生成 VLESS Encryption 参数失败"
+  st_set VENC_SERVER "mlkem768x25519plus.native.600s.${priv}"
+  st_set VENC_CLIENT "mlkem768x25519plus.native.0rtt.${pass}"
+}
+
+# --------------------------------------------------------------- 端口占用 ----
+port_in_use() { # $1=port
+  [ "$DRY" = "1" ] && return 1
+  local p="$1" hex
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltnu 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${p}$"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnu 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$"
+  else
+    hex="$(printf '%04X' "$p")"
+    awk -v h="$hex" '{split($2,a,":"); if (a[2]==h && $4=="0A") f=1} END{exit !f}' \
+      /proc/net/tcp /proc/net/tcp6 2>/dev/null
+  fi
+}
+
+# 列出本机监听 socket（无 ss/netstat 时回退 /proc）
+listen_socks() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -Hltnu 2>/dev/null | awk '{print $1" "$5}'
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnu 2>/dev/null | awk 'NR>2{print $1" "$4}'
+  else
+    awk 'NR>1{printf "%s %s\n", "tcp", $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+  fi
+}
+
+# ---------------------------------------------------------- 配置渲染(纯函数) ----
+# render_config <输出文件>   只依赖 ST 与全局变量，方便 selftest 复用
+render_config() {
+  local out="$1"
+  local proto egress route port listen_addr unrouted
+  proto="$(st_get PROTO ss)"
+  egress="$(st_get EGRESS_MODE local)"
+  route="$(st_get ROUTE_MODE auto)"
+  port="$(st_get PORT 35688)"
+  listen_addr="$(st_get LISTEN_ADDR ::)"
+  unrouted="$(st_get UNROUTED 1)"
+
+  {
+    printf '# generated by mlr v%s at %s — 手工修改会被下次生成覆盖\n' "$MLR_VERSION" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'mixed-port: 0\n'
+    printf 'allow-lan: false\n'
+    printf 'mode: rule\n'
+    printf 'log-level: %s\n' "$(st_get LOG_LEVEL info)"
+    printf 'ipv6: true\n'
+    printf 'unified-delay: true\n'
+    printf 'tcp-concurrent: true\n'
+    printf 'find-process-mode: "off"\n'
+    printf 'external-controller: 127.0.0.1:9090\n'
+    printf 'profile:\n  store-selected: false\n  store-fake-ip: false\n'
+    printf 'dns:\n'
+    printf '  enable: true\n'
+    printf '  ipv6: true\n'
+    printf '  listen: 127.0.0.1:15353\n'
+    printf '  enhanced-mode: normal\n'
+    printf '  nameserver:\n'
+    printf '    - 223.5.5.5\n'
+    printf '    - 119.29.29.29\n'
+    printf '  fallback:\n'
+    printf '    - https://1.1.1.1/dns-query\n'
+    printf '    - tls://8.8.8.8\n'
+    printf '  fallback-filter:\n'
+    printf '    geoip: true\n'
+    printf '    geoip-code: CN\n'
+
+    # --- 出站 ---
+    printf '\nproxies:\n'
+    if [ "$egress" = "landing" ]; then
+      render_landing_proxy
+    else
+      printf '  []\n'
+    fi
+
+    printf '\nproxy-groups:\n'
+    if [ "$egress" = "landing" ]; then
+      printf '  - name: Landing\n    type: select\n    proxies:\n      - LandingNode\n      - DIRECT\n'
+    else
+      printf '  []\n'
+    fi
+
+    # --- 入站 ---
+    printf '\nlisteners:\n'
+    if [ "$proto" = "ss" ]; then
+      printf '  - name: in-ss\n'
+      printf '    type: shadowsocks\n'
+      printf '    port: %s\n' "$port"
+      printf '    listen: %s\n' "$(yaml_q "$listen_addr")"
+      printf '    cipher: %s\n' "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)"
+      printf '    password: %s\n' "$(yaml_q "$(st_get SS_PASS)")"
+      printf '    udp: true\n'
+    else
+      printf '  - name: in-vless\n'
+      printf '    type: vless\n'
+      printf '    port: %s\n' "$port"
+      printf '    listen: %s\n' "$(yaml_q "$listen_addr")"
+      printf '    users:\n'
+      printf '      - username: u1\n'
+      printf '        uuid: %s\n' "$(st_get UUID)"
+      if [ "$proto" = "reality" ] || [ "$proto" = "vlessenc" ]; then
+        printf '        flow: xtls-rprx-vision\n'
+      fi
+      if [ "$proto" = "vlessenc" ]; then
+        printf '    decryption: %s\n' "$(yaml_q "$(st_get VENC_SERVER)")"
+      fi
+      if [ "$proto" = "reality" ] || [ "$proto" = "vlessenc" ]; then
+        printf '    reality-config:\n'
+        printf '      dest: %s\n' "$(yaml_q "$(st_get REALITY_DEST www.microsoft.com:443)")"
+        printf '      private-key: %s\n' "$(st_get REALITY_PRIV)"
+        printf '      short-id:\n'
+        printf '        - %s\n' "$(st_get REALITY_SID)"
+        printf '      server-names:\n'
+        printf '        - %s\n' "$(st_get REALITY_SNI www.microsoft.com)"
+      fi
+    fi
+
+    # --- 分流 ---
+    printf '\nrules:\n'
+    case "$route" in
+      split)
+        printf '  - GEOIP,CN,DIRECT\n'
+        printf '  - MATCH,%s\n' "$([ "$egress" = "landing" ] && echo Landing || echo DIRECT)"
+        ;;
+      global)
+        printf '  - MATCH,%s\n' "$([ "$egress" = "landing" ] && echo Landing || echo DIRECT)"
+        ;;
+      *)
+        # auto：有落地就全部走落地，没落地就本机直出
+        printf '  - MATCH,%s\n' "$([ "$egress" = "landing" ] && echo Landing || echo DIRECT)"
+        ;;
+    esac
+    [ "$unrouted" = "1" ] && true
+  } > "$out"
+  chmod 600 "$out" 2>/dev/null || true
+}
+
+render_landing_proxy() {
+  local t
+  t="$(st_get LANDING_PROTO ss)"
+  case "$t" in
+    ss)
+      printf '  - name: LandingNode\n'
+      printf '    type: ss\n'
+      printf '    server: %s\n' "$(yaml_q "$(st_get LANDING_HOST)")"
+      printf '    port: %s\n' "$(st_get LANDING_PORT 35688)"
+      printf '    cipher: %s\n' "$(st_get LANDING_CIPHER 2022-blake3-aes-256-gcm)"
+      printf '    password: %s\n' "$(yaml_q "$(st_get LANDING_PASS)")"
+      printf '    udp: true\n'
+      ;;
+    trojan)
+      printf '  - name: LandingNode\n'
+      printf '    type: trojan\n'
+      printf '    server: %s\n' "$(yaml_q "$(st_get LANDING_HOST)")"
+      printf '    port: %s\n' "$(st_get LANDING_PORT 443)"
+      printf '    password: %s\n' "$(yaml_q "$(st_get LANDING_PASS)")"
+      printf '    sni: %s\n' "$(st_get LANDING_SNI)"
+      printf '    skip-cert-verify: true\n'
+      printf '    udp: true\n'
+      ;;
+    vless)
+      printf '  - name: LandingNode\n'
+      printf '    type: vless\n'
+      printf '    server: %s\n' "$(yaml_q "$(st_get LANDING_HOST)")"
+      printf '    port: %s\n' "$(st_get LANDING_PORT 443)"
+      printf '    uuid: %s\n' "$(st_get LANDING_UUID)"
+      printf '    flow: xtls-rprx-vision\n'
+      printf '    tls: true\n'
+      printf '    servername: %s\n' "$(st_get LANDING_SNI)"
+      printf '    client-fingerprint: chrome\n'
+      printf '    udp: true\n'
+      if [ -n "$(st_get LANDING_PBK)" ]; then
+        printf '    reality-opts:\n'
+        printf '      public-key: %s\n' "$(st_get LANDING_PBK)"
+        printf '      short-id: %s\n' "$(st_get LANDING_SID)"
+      fi
+      if [ -n "$(st_get LANDING_ENC)" ]; then
+        printf '    encryption: %s\n' "$(yaml_q "$(st_get LANDING_ENC)")"
+      fi
+      ;;
+  esac
+  if [ "$(st_get LANDING_IPVER auto)" = "ipv6" ]; then
+    printf '    ip-version: ipv6\n'
+  fi
+}
+
+# ------------------------------------------------------------- 应用/回滚 ----
+apply_config() {
+  local tmp="$CFG.new"
+  render_config "$tmp" || { err "生成配置失败"; return 1; }
+
+  if [ -x "$BIN" ]; then
+    if ! "$BIN" -t -d "$ETC" -f "$tmp" >"$ETC/.mlr-test.log" 2>&1; then
+      err "配置校验未通过："
+      sed -n '1,20p' "$ETC/.mlr-test.log" >&2
+      return 1
+    fi
+    ok "mihomo -t 配置校验通过"
+  fi
+
+  mkdir -p "$BK"
+  [ -f "$CFG" ] && cp -f "$CFG" "$BK/config.$(date +%s).yaml"
+  mv -f "$tmp" "$CFG"
+  chmod 600 "$CFG"
+
+  svc_write_unit
+  if ! svc_restart; then
+    err "启动失败，尝试回滚到上一次配置"
+    restore_last_backup && svc_restart || true
+    return 1
+  fi
+  st_save
+  ok "已生效"
+}
+
+restore_last_backup() {
+  local f
+  f="$(ls -1t "$BK"/config.*.yaml 2>/dev/null | head -1)"
+  [ -n "$f" ] || { warn "没有可用备份"; return 1; }
+  cp -f "$f" "$CFG"
+  ok "已还原：$(basename "$f")"
+}
+
+# ---------------------------------------------------------------- GEO 数据 ----
+geo_update() {
+  local d="$ETC" url base="https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest"
+  mkdir -p "$d"
+  for f in geoip.metadb geosite.dat; do
+    info "更新 $f"
+    if ! curl -fL --retry 2 --max-time 120 -o "$d/$f.tmp" "$base/$f" 2>/dev/null; then
+      curl -fL --retry 2 --max-time 120 -o "$d/$f.tmp" "https://ghfast.top/$base/$f" 2>/dev/null \
+        || { warn "$f 下载失败，跳过"; rm -f "$d/$f.tmp"; continue; }
+    fi
+    [ -s "$d/$f.tmp" ] && mv -f "$d/$f.tmp" "$d/$f"
+  done
+  ok "GEO 数据已更新"
+}
+
+# ------------------------------------------------------------- 入口：描述 ----
+ingress_desc() {
+  case "$(st_get INGRESS v6)" in
+    v6)    printf 'IPv6 直连 :%s' "$(st_get PORT 35688)" ;;
+    nat)   printf 'IPv4 NAT %s:%s → 内网 %s' "$(st_get NAT_PUB_IP -)" "$(st_get NAT_PUB_PORT -)" "$(st_get NAT_INT_PORT -)" ;;
+    relay) printf '自有v4中转 %s (%s)' "$(st_get RELAY_HOST -)" "$(st_get RELAY_MODE realm)" ;;
+    *)     printf '未设置' ;;
+  esac
+}
+
+proto_desc() {
+  case "$(st_get PROTO ss)" in
+    ss)        printf 'Shadowsocks 2022' ;;
+    reality)   printf 'VLESS Reality' ;;
+    vlessenc)  printf 'VLESS Encryption (PQ)' ;;
+    *)         printf '未设置' ;;
+  esac
+}
+
+egress_desc() {
+  if [ "$(st_get EGRESS_MODE local)" = "landing" ]; then
+    printf '落地 %s:%s (%s)' "$(st_get LANDING_HOST -)" "$(st_get LANDING_PORT -)" "$(st_get LANDING_PROTO ss)"
+  else
+    printf '本机直出'
+  fi
+}
+
+# 对外可用的「主机:端口」——用于生成客户端链接
+public_endpoint() {
+  case "$(st_get INGRESS v6)" in
+    v6)    printf '%s %s' "$(st_get V6ADDR)" "$(st_get PORT 35688)" ;;
+    nat)   printf '%s %s' "$(st_get NAT_PUB_IP)" "$(st_get NAT_PUB_PORT)" ;;
+    relay)
+      if [ "$(st_get RELAY_MODE realm)" = "realm" ]; then
+        printf '%s %s' "$(st_get RELAY_HOST)" "$(st_get RELAY_PORT)"
+      else
+        printf '%s %s' "$(st_get RELAY_HOST)" "$(st_get RELAY_PUB_PORT)"
+      fi
+      ;;
+    *) printf '%s %s' "$(st_get V6ADDR)" "$(st_get PORT 35688)" ;;
+  esac
+}
+
+# ------------------------------------------------------------ 入口 菜单 ----
+menu_ingress() {
+  while :; do
+    clear 2>/dev/null || true
+    hr
+    printf '  入口配置   当前：%s\n' "$(ingress_desc)"
+    hr
+    printf ' 1. IPv6 公网直连        （裸连，无需任何额外配置，延迟最低）\n'
+    printf ' 2. 供应商 IPv4 NAT 入口 （填运营商给的 公网v4:端口，本机按需做端口重定向）\n'
+    printf ' 3. 自有公网 v4 中转机   （生成 Realm 或 WireGuard 隧道，双端配置）\n'
+    printf ' 9. 重新探测本机网络\n'
+    printf ' 0. 返回\n'
+    hr
+    ask c '请输入选项' 1 >/dev/null
+    case "$c" in
+      1) do_ingress_v6 ;;
+      2) do_ingress_nat ;;
+      3) menu_relay ;;
+      9) do_detect ;;
+      0) return ;;
+      *) warn "无效选项" ;;
+    esac
+    st_save
+  done
+}
+
+do_ingress_v6() {
+  local v6
+  v6="$(det_v6)"
+  if [ -z "$v6" ]; then
+    warn "没有检测到全局 IPv6 地址，请确认网卡配置"
+    ask v6 '手动输入本机 IPv6' '' 
+    [ -z "$v6" ] && return 1
+  fi
+  st_set INGRESS v6
+  st_set V6ADDR "$v6"
+  ok "入口已设为 IPv6 直连：[$v6]:$(st_get PORT 35688)"
+  info "客户端直连地址（需自身有 IPv6）：[$v6]:$(st_get PORT 35688)"
+  info "本机防火墙记得放行端口，见「6. 状态/自检」里的放行命令"
+}
+
+do_ingress_nat() {
+  local pub pp iport
+  hr
+  printf ' 供应商给的 IPv4 NAT 入口：公网 v4:端口  →  映射到本机 内网v4:端口\n'
+  printf ' 大多数商家是 1:1 映射（外部端口=内部端口），只需要填外部地址。\n'
+  hr
+  ask pub  '公网 IPv4（商家提供的入口地址）' "$(st_get NAT_PUB_IP)"
+  [ -z "$pub" ] && { warn "必须填写公网 IPv4"; return 1; }
+  ask_port pp '公网端口' "$(st_get NAT_PUB_PORT "$(st_get PORT 35688)")"
+  ask_port iport '映射到本机的端口（通常与公网端口相同）' "$(st_get NAT_INT_PORT "$pp")"
+
+  st_set INGRESS nat
+  st_set NAT_PUB_IP "$pub"
+  st_set NAT_PUB_PORT "$pp"
+  st_set NAT_INT_PORT "$iport"
+
+  if [ "$iport" != "$(st_get PORT 35688)" ]; then
+    info "内部端口 $iport 与监听端口 $(st_get PORT 35688) 不同，本机添加端口重定向"
+    fw_redirect "$iport" "$(st_get PORT 35688)"
+  fi
+  ok "入口已设为 IPv4 NAT：$pub:$pp → 本机 $iport"
+  info "若商家面板支持自定义映射，确保 外部 $pp → 内网 $(det_v4_local 2>/dev/null || echo 10.x.x.x):$iport"
+  info "「查看链接」里生成的地址会自动用 $pub:$pp"
+}
+
+fw_redirect() { # $1=from_port $2=to_port
+  [ "$DRY" = "1" ] && { info "DRY: iptables REDIRECT $1→$2"; return 0; }
+  iptables -t nat -C PREROUTING -p tcp --dport "$1" -j REDIRECT --to-ports "$2" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p tcp --dport "$1" -j REDIRECT --to-ports "$2"
+  iptables -t nat -C PREROUTING -p udp --dport "$1" -j REDIRECT --to-ports "$2" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport "$1" -j REDIRECT --to-ports "$2"
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 && ok "重定向规则已持久化"
+  else
+    warn "未安装 iptables-persistent，重启后规则会失效；可执行：apt install iptables-persistent"
+  fi
+}
+
+# --------------------------------------------------------- 入口：v4 中转 ----
+menu_relay() {
+  while :; do
+    hr
+    printf ' 自有公网 v4 中转机（你有另一台带公网 v4 的机器）\n'
+    printf ' 当前：%s\n' "$(ingress_desc)"
+    hr
+    printf ' 1. Realm 转发   中转机必须有 IPv6（直接按 v6 回源到本机）\n'
+    printf ' 2. WireGuard    中转机没有 IPv6 也行（本机主动拨出建隧道）\n'
+    printf ' 0. 返回\n'
+    hr
+    ask c '请输入选项' "" >/dev/null
+    case "$c" in
+      1) do_relay_realm ;;
+      2) do_relay_wg ;;
+      0) return ;;
+    esac
+  done
+}
+
+do_relay_realm() {
+  local host rport
+  ask host '中转机公网 IPv4 或域名' "$(st_get RELAY_HOST)"
+  [ -z "$host" ] && return 1
+  ask_port rport '中转机对外端口（客户端连这个）' "$(st_get RELAY_PORT "$(st_get PORT 35688)")"
+  st_set INGRESS relay; st_set RELAY_MODE realm
+  st_set RELAY_HOST "$host"; st_set RELAY_PORT "$rport"
+
+  local v6 port
+  v6="$(st_get V6ADDR "$(det_v6)")"; port="$(st_get PORT 35688)"
+  [ -z "$v6" ] && die "本机没有 IPv6 地址，Realm 方案不可用"
+
+  cat <<EOF
+
+---- 在中转机（$host）上执行 ----------------------------------
+# 1) 装 realm
+curl -fL -o /tmp/realm.tar.gz https://github.com/zhboner/realm/releases/latest/download/realm-x86_64-unknown-linux-musl.tar.gz
+tar -xzf /tmp/realm.tar.gz -C /usr/local/bin --strip-components=1 && chmod +x /usr/local/bin/realm
+
+# 2) 配置 /etc/realm/config.toml
+cat > /etc/realm/config.toml <<'TOML'
+[network]
+no_tcp = false
+use_udp = true
+
+[[endpoints]]
+listen = "0.0.0.0:$rport"
+remote = "[$v6]:$port"
+TOML
+
+# 3) 开机自启
+cat > /etc/systemd/system/realm.service <<'UNIT'
+[Unit]
+Description=realm forwarder
+After=network-online.target
+[Service]
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload && systemctl enable --now realm
+# 4) 放行端口
+iptables -I INPUT -p tcp --dport $rport -j ACCEPT
+iptables -I INPUT -p udp --dport $rport -j ACCEPT
+---------------------------------------------------------------
+
+EOF
+  ok "Realm 方案已记录：$host:$rport → [$v6]:$port"
+}
+
+gen_wg_keypair() { # 输出 "私钥 公钥"
+  local priv pub
+  if command -v wg >/dev/null 2>&1; then
+    priv="$(wg genkey)"; pub="$(printf '%s' "$priv" | wg pubkey)"
+  elif [ -x "$BIN" ]; then
+    local out; out="$("$BIN" generate wg-keypair 2>/dev/null)"
+    priv="$(printf '%s\n' "$out" | sed -n 's/^PrivateKey: *//p')"
+    pub="$(printf '%s\n' "$out" | sed -n 's/^PublicKey: *//p')"
+  else
+    die "需要 wireguard-tools 或 mihomo 来生成密钥"
+  fi
+  printf '%s %s' "$priv" "$pub"
+}
+
+do_relay_wg() {
+  local host wport pub_port
+  ask host '中转机公网 IPv4 或域名' "$(st_get RELAY_HOST)"
+  [ -z "$host" ] && return 1
+  ask_port wport 'WireGuard 监听端口（中转机上）' "$(st_get RELAY_WG_PORT 51820)"
+  ask_port pub_port '客户端连接中转机的对外端口' "$(st_get RELAY_PUB_PORT "$(st_get PORT 35688)")"
+
+  local srvp srvpub clip clipub kp
+  kp="$(gen_wg_keypair)"; srvp="${kp%% *}"; srvpub="${kp#* }"
+  kp="$(gen_wg_keypair)"; clip="${kp%% *}"; clipub="${kp#* }"
+
+  st_set INGRESS relay; st_set RELAY_MODE wg
+  st_set RELAY_HOST "$host"; st_set RELAY_WG_PORT "$wport"; st_set RELAY_PUB_PORT "$pub_port"
+  st_set WG_SRV_PRIV "$srvp"; st_set WG_SRV_PUB "$srvpub"
+  st_set WG_CLI_PRIV "$clip"; st_set WG_CLI_PUB "$clipub"
+
+  local port; port="$(st_get PORT 35688)"
+
+  cat <<EOF
+
+---- ① 中转机（$host） ----------------------------------------
+apt install -y wireguard-tools iptables
+cat > /etc/wireguard/wg0.conf <<'WGC'
+[Interface]
+Address = 10.66.66.1/24
+ListenPort = $wport
+PrivateKey = $srvp
+PostUp   = iptables -I INPUT -p udp --dport $wport -j ACCEPT
+PostUp   = iptables -I FORWARD -i wg0 -j ACCEPT
+PostUp   = iptables -I FORWARD -o wg0 -j ACCEPT
+PostUp   = iptables -t nat -A PREROUTING -p tcp --dport $pub_port -j DNAT --to-destination 10.66.66.2:$port
+PostUp   = iptables -t nat -A PREROUTING -p udp --dport $pub_port -j DNAT --to-destination 10.66.66.2:$port
+PostUp   = iptables -t nat -A POSTROUTING -s 10.66.66.0/24 -j MASQUERADE
+PostDown = iptables -t nat -D PREROUTING -p tcp --dport $pub_port -j DNAT --to-destination 10.66.66.2:$port
+PostDown = iptables -t nat -D PREROUTING -p udp --dport $pub_port -j DNAT --to-destination 10.66.66.2:$port
+
+[Peer]
+PublicKey = $clipub
+AllowedIPs = 10.66.66.2/32
+WGC
+sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wg.conf
+systemctl enable --now wg-quick@wg0
+
+---- ② 本机（入口机，也就是这台）-------------------------------
+apt install -y wireguard-tools
+cat > /etc/wireguard/wg0.conf <<'WGC'
+[Interface]
+Address = 10.66.66.2/24
+PrivateKey = $clip
+Table = off
+PostUp = ip -6 route replace default dev wg0 2>/dev/null || true
+
+[Peer]
+PublicKey = $srvpub
+Endpoint = $host:$wport
+AllowedIPs = 10.66.66.1/32
+PersistentKeepalive = 25
+WGC
+systemctl enable --now wg-quick@wg0
+# mihomo 的监听地址已经是 "::" ，会同时监听 10.66.66.2，无需改动
+---------------------------------------------------------------
+
+EOF
+  warn "注意：本机需要有可用的 v4 出网（NAT 也行）才能连上中转机；若完全无 v4，请改用 Realm（中转机需有 v6）"
+  ok "WG 方案已记录：客户端连 $host:$pub_port"
+}
+
+# --------------------------------------------------------------- 出口 菜单 ----
+menu_egress() {
+  while :; do
+    clear 2>/dev/null || true
+    hr
+    printf '  出口配置   当前：%s\n' "$(egress_desc)"
+    hr
+    printf ' 1. 本机直出            （本机就是出口，最简单，适合只要「换个入口」）\n'
+    printf ' 2. 指定落地机          （填入落地 IP/域名+端口+凭据，流量经落地出网）\n'
+    printf ' 3. 清空落地，回到本机直出\n'
+    printf ' 0. 返回\n'
+    hr
+    ask c '请输入选项' "" >/dev/null
+    case "$c" in
+      1) st_set EGRESS_MODE local; ok "出口：本机直出" ;;
+      2) do_landing ;;
+      3) st_set EGRESS_MODE local; st_save; ok "已回到本机直出" ;;
+      0) return ;;
+    esac
+    st_save
+  done
+}
+
+do_landing() {
+  local host port proto uuid="" pbk="" sid="" enc="" ipver="" cipher="" pass="" sni=""
+  hr
+  printf ' 落地机 = 真正出网的那台（例如日本/新加坡 VPS）\n'
+  printf ' 如果落地机也用本脚本部署，直接在那边「查看链接」抄参数即可。\n'
+  hr
+  ask host '落地机 IP 或域名' "$(st_get LANDING_HOST)"
+  [ -z "$host" ] && return 1
+  ask_port port '落地机端口' "$(st_get LANDING_PORT 35688)"
+
+  printf ' 协议：1) Shadowsocks(2022)  2) VLESS Reality  3) Trojan  4) VLESS Encryption(PQ)\n'
+  ask proto '请输入选项' 1 >/dev/null
+  case "$proto" in
+    1) proto=ss ;;
+    2) proto=vless ;;
+    3) proto=trojan ;;
+    4) proto=vlessenc ;;
+    *) proto=ss ;;
+  esac
+
+  case "$proto" in
+    ss)
+      ask cipher '加密方式' "$(st_get LANDING_CIPHER 2022-blake3-aes-256-gcm)"
+      ask pass '密码（2022 系列为 base64 密钥）' "$(st_get LANDING_PASS)"
+      [ -z "$pass" ] && { warn "密码不能为空"; return 1; }
+      st_set LANDING_CIPHER "$cipher"; st_set LANDING_PASS "$pass"
+      ;;
+    trojan)
+      ask pass '密码' "$(st_get LANDING_PASS)"
+      ask sni  'SNI / 伪装域名' "$(st_get LANDING_SNI)"
+      st_set LANDING_PASS "$pass"; st_set LANDING_SNI "$sni"
+      ;;
+    vless)
+      ask uuid 'UUID' "$(st_get LANDING_UUID)"
+      ask sni  'SNI / 伪装域名' "$(st_get LANDING_SNI)"
+      ask pbk  'Reality 公钥 (pbk，落地机生成)' "$(st_get LANDING_PBK)"
+      ask sid  'Reality short-id' "$(st_get LANDING_SID)"
+      st_set LANDING_UUID "$uuid"; st_set LANDING_SNI "$sni"
+      st_set LANDING_PBK "$pbk"; st_set LANDING_SID "$sid"
+      ;;
+    vlessenc)
+      ask uuid 'UUID' "$(st_get LANDING_UUID)"
+      ask sni  'SNI / 伪装域名' "$(st_get LANDING_SNI)"
+      ask pbk  'Reality 公钥 (pbk)' "$(st_get LANDING_PBK)"
+      ask sid  'Reality short-id' "$(st_get LANDING_SID)"
+      ask enc  'encryption 值（落地机生成的 [Client] 那一行）' "$(st_get LANDING_ENC)"
+      st_set LANDING_UUID "$uuid"; st_set LANDING_SNI "$sni"
+      st_set LANDING_PBK "$pbk"; st_set LANDING_SID "$sid"; st_set LANDING_ENC "$enc"
+      ;;
+  esac
+
+  ask ipver '落地机是否只能走 IPv6 连？(auto/ipv6)' "$(st_get LANDING_IPVER auto)"
+  st_set LANDING_IPVER "$ipver"
+  st_set EGRESS_MODE landing
+  st_set LANDING_HOST "$host"; st_set LANDING_PORT "$port"; st_set LANDING_PROTO "$([ "$proto" = vlessenc ] && echo vless || echo "$proto")"
+  [ "$proto" = vlessenc ] && st_set LANDING_ENC "$(st_get LANDING_ENC)"
+  ok "落地已记录：$host:$port ($proto)"
+}
+
+# --------------------------------------------------------------- 协议 菜单 ----
+menu_protocol() {
+  while :; do
+    clear 2>/dev/null || true
+    hr
+    printf '  协议配置   当前：%s   端口：%s\n' "$(proto_desc)" "$(st_get PORT 35688)"
+    hr
+    printf ' 1. Shadowsocks 2022    （兼容性最好，UDP 全支持，推荐先跑通）\n'
+    printf ' 2. VLESS Reality       （TLS 伪装，抗主动探测，TCP 单栈）\n'
+    printf ' 3. VLESS Encryption PQ （后量子加密，需较新客户端）\n'
+    printf ' 4. 修改监听端口\n'
+    printf ' 5. 重新生成该协议的密钥\n'
+    printf ' 0. 返回\n'
+    hr
+    ask c '请输入选项' "" >/dev/null
+    case "$c" in
+      1) do_proto_ss ;;
+      2) do_proto_reality ;;
+      3) do_proto_vlessenc ;;
+      4) do_port ;;
+      5) do_regen ;;
+      0) return ;;
+    esac
+    st_save
+  done
+}
+
+do_port() {
+  local p; p="$(st_get PORT 35688)"
+  ask_port p '监听端口' "$p"
+  if port_in_use "$p"; then warn "端口 $p 已被占用，请确认"; fi
+  st_set PORT "$p"; ok "端口已设为 $p"
+}
+
+do_proto_ss() {
+  local cipher
+  printf ' 1) 2022-blake3-aes-256-gcm（推荐） 2) 2022-blake3-aes-128-gcm 3) aes-256-gcm(旧)\n'
+  ask c '请输入选项' 1 >/dev/null
+  case "$c" in
+    2) cipher=2022-blake3-aes-128-gcm ;;
+    3) cipher=aes-256-gcm ;;
+    *) cipher=2022-blake3-aes-256-gcm ;;
+  esac
+  st_set PROTO ss
+  st_set SS_CIPHER "$cipher"
+  if [ "$(st_get SS_CIPHER_SAVED)" != "$cipher" ] || [ -z "$(st_get SS_PASS)" ]; then
+    if [[ "$cipher" == 2022-* ]]; then
+      st_set SS_PASS "$(gen_ss_pass "$cipher")"
+    else
+      ask p '自定义密码（留空自动生成）' ""
+      [ -z "$p" ] && p="$(head -c 18 /dev/urandom | base64 | tr -d '\n=+/')"
+      st_set SS_PASS "$p"
+    fi
+    st_set SS_CIPHER_SAVED "$cipher"
+  fi
+  ok "Shadowsocks 已就绪：$cipher"
+}
+
+do_proto_reality() {
+  local sni dest
+  ask sni '伪装域名 SNI（建议微软件的 www.microsoft.com）' "$(st_get REALITY_SNI www.microsoft.com)"
+  dest="$(st_get REALITY_DEST "$sni:443")"
+  st_set PROTO reality
+  st_set REALITY_SNI "$sni"; st_set REALITY_DEST "$dest"
+  [ -z "$(st_get UUID)" ] && st_set UUID "$(gen_uuid)"
+  if [ -z "$(st_get REALITY_PRIV)" ] || [ -z "$(st_get REALITY_PUB)" ]; then gen_reality; fi
+  ok "VLESS Reality 已就绪：SNI=$sni"
+}
+
+do_proto_vlessenc() {
+  local sni
+  ask sni '伪装域名 SNI' "$(st_get REALITY_SNI www.microsoft.com)"
+  st_set PROTO vlessenc
+  st_set REALITY_SNI "$sni"; st_set REALITY_DEST "$(st_get REALITY_DEST "$sni:443")"
+  [ -z "$(st_get UUID)" ] && st_set UUID "$(gen_uuid)"
+  [ -z "$(st_get REALITY_PRIV)" ] && gen_reality
+  [ -z "$(st_get VENC_SERVER)" ] && gen_vlessenc
+  ok "VLESS Encryption (PQ) 已就绪"
+}
+
+do_regen() {
+  case "$(st_get PROTO ss)" in
+    ss) st_set SS_PASS "$(gen_ss_pass "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)")"; ok "SS 密码已重生成" ;;
+    reality) gen_reality; st_set UUID "$(gen_uuid)"; ok "Reality 密钥/UUID 已重生成" ;;
+    vlessenc) gen_reality; gen_vlessenc; st_set UUID "$(gen_uuid)"; ok "PQ 参数已重生成" ;;
+  esac
+}
+
+menu_routing() {
+  hr
+  printf ' 分流   当前：%s\n' "$(st_get ROUTE_MODE auto)"
+  hr
+  printf ' 1. 全部走出口（推荐，最省心）\n'
+  printf ' 2. 国内直连 + 其余走出口（省流量/降延迟，依赖 GEOIP 数据）\n'
+  printf ' 0. 返回\n'
+  hr
+  ask c '请输入选项' "" >/dev/null
+  case "$c" in
+    1) st_set ROUTE_MODE global; ok "全部走出口" ;;
+    2) st_set ROUTE_MODE split; ok "国内直连" ;;
+    0) return ;;
+  esac
+  st_save
+}
+
+b64url() { base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '='; }
+urlenc() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/?/%3F/g' -e 's/#/%23/g' -e 's/&/%26/g' -e 's/=/%3D/g' -e 's/+/%2B/g'; }
+
+# ------------------------------------------------------- 链接 / 客户端配置 ----
+show_links() {
+  local host port remark
+  read -r host port <<<"$(public_endpoint)"
+  [ -z "${host:-}" ] && { warn "还没配置入口，先跑一遍「1. 入口」"; pause; return; }
+  remark="mlr-$(st_get PROTO ss)-$(st_get INGRESS v6)"
+
+  hr
+  printf '  服务端：%s  →  %s\n' "$(ingress_desc)" "$(egress_desc)"
+  printf '  对外地址：%s:%s\n' "$host" "$port"
+  hr
+
+  case "$(st_get PROTO ss)" in
+    ss)
+      printf '\n# Shadowsocks 链接\n'
+      printf 'ss://%s@%s:%s#%s\n' \
+        "$(printf '%s:%s' "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" | b64url)" \
+        "$host" "$port" "$remark"
+      ;;
+    reality)
+      printf '\n# VLESS Reality 链接\n'
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$(st_get UUID)" "$host" "$port" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$remark"
+      ;;
+    vlessenc)
+      printf '\n# VLESS Encryption (PQ) 链接\n'
+      printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$(st_get UUID)" "$host" "$port" "$(urlenc "$(st_get VENC_CLIENT)")" \
+        "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$remark"
+      ;;
+  esac
+
+  printf '\n# mihomo / Clash.Meta 客户端片段（直接粘到 proxies 下）\n'
+  case "$(st_get PROTO ss)" in
+    ss)
+      printf '  - name: "%s"\n    type: ss\n    server: %s\n    port: %s\n    cipher: %s\n    password: "%s"\n    udp: true\n' \
+        "$remark" "$host" "$port" "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" ;;
+    reality)
+      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
+        "$remark" "$host" "$port" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
+    vlessenc)
+      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    encryption: "%s"\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
+        "$remark" "$host" "$port" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get VENC_CLIENT)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
+  esac
+  hr
+  [ "$(st_get EGRESS_MODE local)" = "landing" ] && \
+    info "落地机若也用本脚本，把上面这段反向填到落地机的「2. 指定落地机」里即可"
+  pause
+}
+
+# ---------------------------------------------------------------- 状态/自检 ----
+show_status() {
+  hr
+  printf '  服务：%s\n' "$(svc_active && echo "运行中" || echo "未运行")"
+  printf '  二进制：%s %s\n' "$BIN" "$([ -x "$BIN" ] && "$BIN" -v 2>/dev/null | head -1 || echo '(未安装)')"
+  printf '  配置：%s %s\n' "$CFG" "$([ -f "$CFG" ] && echo "($(wc -l <"$CFG") 行)" || echo '(不存在)')"
+  printf '  入口：%s\n' "$(ingress_desc)"
+  printf '  出口：%s\n' "$(egress_desc)"
+  printf '  协议：%s  端口：%s\n' "$(proto_desc)" "$(st_get PORT 35688)"
+  hr
+  printf ' 监听：\n'
+  local _l _found=0
+  while read -r _l; do
+    case "$_l" in *":$(st_get PORT 35688)"*) printf '   %s\n' "$_l"; _found=1 ;; esac
+  done < <(listen_socks)
+  [ "$_found" = "1" ] || printf '   （未监听 %s）\n' "$(st_get PORT 35688)"
+  printf ' 本机 IPv6：%s\n' "$(det_v6 || true)"
+  printf ' 本机内网 IPv4：%s\n' "$(det_v4_local || true)"
+  printf ' 本机 v4 出网：%s\n' "$(probe_egress4 2>/dev/null || echo "不可用")"
+  hr
+  printf ' 防火墙放行（按需执行）：\n'
+  printf '   iptables -I INPUT -p tcp --dport %s -j ACCEPT\n' "$(st_get PORT 35688)"
+  printf '   iptables -I INPUT -p udp --dport %s -j ACCEPT\n' "$(st_get PORT 35688)"
+  printf '   ip6tables -I INPUT -p tcp --dport %s -j ACCEPT\n' "$(st_get PORT 35688)"
+  hr
+  printf ' 最近日志：\n'
+  journalctl -u "$SVC" -n 12 --no-pager 2>/dev/null | sed 's/^/   /' || echo "   （无）"
+  hr
+  pause
+}
+
+# ------------------------------------------------------------ 备份/卸载 ----
+menu_backup() {
+  hr
+  printf ' 1. 备份当前配置\n 2. 还原上一次备份\n 3. 查看备份列表\n 4. 卸载 mihomo 与脚本环境\n 0. 返回\n'
+  hr
+  ask c '请输入选项' "" >/dev/null
+  case "$c" in
+    1) mkdir -p "$BK"; cp -f "$CFG" "$BK/config.$(date +%s).yaml" && ok "已备份" ;;
+    2) restore_last_backup && svc_restart ;;
+    3) ls -1t "$BK" 2>/dev/null | head -20 || warn "暂无备份" ;;
+    4) do_uninstall ;;
+    0) return ;;
+  esac
+  pause
+}
+
+do_uninstall() {
+  confirm "确认卸载？将停止服务并删除 ${BIN}（配置与备份保留）" N || return 1
+  if [ "$DRY" != "1" ]; then
+    systemctl disable --now "$SVC" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${SVC}.service"
+    systemctl daemon-reload 2>/dev/null || true
+    rm -f "$BIN"
+  fi
+  ok "已卸载（配置留在 $ETC，可手动删除）"
+}
+
+do_selfupdate() {
+  local tmp; tmp="$(mktemp)"
+  info "从 $MLR_RAW/mlr 获取最新版本"
+  if ! curl -fsSL --max-time 30 -o "$tmp" "$MLR_RAW/mlr"; then
+    err "下载失败"; rm -f "$tmp"; return 1
+  fi
+  bash -n "$tmp" || { err "新版本语法检查失败，放弃"; rm -f "$tmp"; return 1; }
+  local nv; nv="$(grep -m1 '^MLR_VERSION=' "$tmp" | cut -d'"' -f2)"
+  info "本地 $MLR_VERSION / 远端 ${nv:-未知}"
+  install -m 755 "$tmp" "$0" && ok "已更新，重新运行生效"
+  rm -f "$tmp"
+}
+
+# ----------------------------------------------------------------- 自检矩阵 ----
+cmd_selftest() {
+  local work="$ETC/selftest" pass=0 fail=0 t
+  mkdir -p "$work"
+  mihomo_ensure >/dev/null 2>&1 || { err "需要 mihomo 二进制"; return 1; }
+  st_set UUID "$(gen_uuid)"; st_set PORT 35688
+  gen_reality >/dev/null 2>&1; gen_vlessenc >/dev/null 2>&1
+  st_set SS_CIPHER 2022-blake3-aes-256-gcm; st_set SS_PASS "$(gen_ss_pass 2022-blake3-aes-256-gcm)"
+  st_set REALITY_SNI www.microsoft.com; st_set REALITY_DEST www.microsoft.com:443
+
+  local protos=(ss reality vlessenc)
+  local egresses=(local landing_ss landing_vless)
+  local routes=(global split)
+  local listens=('::' '0.0.0.0' '10.66.66.2')
+
+  for p in "${protos[@]}"; do
+    for e in "${egresses[@]}"; do
+      for r in "${routes[@]}"; do
+        st_set PROTO "$p"; st_set ROUTE_MODE "$r"; st_set LISTEN_ADDR '::'
+        case "$e" in
+          local) st_set EGRESS_MODE local ;;
+          landing_ss)
+            st_set EGRESS_MODE landing; st_set LANDING_PROTO ss
+            st_set LANDING_HOST 203.0.113.10; st_set LANDING_PORT 35688
+            st_set LANDING_CIPHER 2022-blake3-aes-256-gcm
+            st_set LANDING_PASS "$(st_get SS_PASS)" ;;
+          landing_vless)
+            st_set EGRESS_MODE landing; st_set LANDING_PROTO vless
+            st_set LANDING_HOST jp.example.com; st_set LANDING_PORT 443
+            st_set LANDING_UUID "$(st_get UUID)"; st_set LANDING_SNI www.microsoft.com
+            st_set LANDING_PBK "$(st_get REALITY_PUB)"; st_set LANDING_SID "$(st_get REALITY_SID)" ;;
+        esac
+        render_config "$work/cfg.yaml"
+        if "$BIN" -t -d "$work" -f "$work/cfg.yaml" >"$work/out.log" 2>&1; then
+          pass=$((pass+1))
+        else
+          fail=$((fail+1)); err "FAIL  proto=$p egress=$e route=$r"
+          sed -n '1,6p' "$work/out.log" | sed 's/^/        /'
+        fi
+      done
+    done
+    # 监听地址变体
+    st_set PROTO "$p"; st_set ROUTE_MODE global; st_set EGRESS_MODE local
+    for l in "${listens[@]}"; do
+      st_set LISTEN_ADDR "$l"
+      render_config "$work/cfg.yaml"
+      if "$BIN" -t -d "$work" -f "$work/cfg.yaml" >"$work/out.log" 2>&1; then
+        pass=$((pass+1))
+      else
+        fail=$((fail+1)); err "FAIL  proto=$p listen=$l"
+        sed -n '1,6p' "$work/out.log" | sed 's/^/        /'
+      fi
+    done
+  done
+
+  st_set LISTEN_ADDR '::'
+  hr
+  printf ' 自检结果：通过 %s / 失败 %s\n' "$pass" "$fail"
+  hr
+  [ "$fail" -eq 0 ]
+}
+
+# ------------------------------------------------------------------ 主菜单 ----
+do_detect() {
+  hr
+  printf ' 系统：%s  架构：%s\n' "$(os_id)" "$(det_arch)"
+  printf ' IPv6：%s\n' "$(det_v6 || echo '无')"
+  printf ' 内网 IPv4：%s\n' "$(det_v4_local || echo '无')"
+  printf ' v4 出网：%s\n' "$(probe_egress4 2>/dev/null || echo '不可用')"
+  printf ' v6 出网：%s\n' "$(probe_egress6 2>/dev/null || echo '不可用')"
+  hr
+  local v6; v6="$(det_v6)"
+  if [ -n "$v6" ] && [ -z "$(probe_egress4 2>/dev/null)" ]; then
+    info "典型 v6-only 线路机：入口走 IPv6 直连，出口建议接落地机或自有 v4 中转"
+  fi
+  pause
+}
+
+first_run() {
+  clear 2>/dev/null || true
+  hr
+  printf '  首次运行向导\n'
+  hr
+  printf ' 1) 选择入口类型（决定客户端怎么连进来）\n'
+  printf ' 2) 选择出口（本机直出 / 落地机）\n'
+  printf ' 3) 生成协议参数并启动\n'
+  hr
+  mihomo_ensure || return 1
+  do_ingress_v6
+  st_set PROTO ss
+  ask c '出口：1) 本机直出  2) 有落地机' 1 >/dev/null
+  if [ "$c" = "2" ]; then do_landing; else st_set EGRESS_MODE local; fi
+  st_save
+  apply_config && show_links
+}
+
+main_menu() {
+  while :; do
+    clear 2>/dev/null || true
+    hr
+    printf '%s        mlr · Mihomo 中转/落地 管理  v%s%s\n' "$C_B" "$MLR_VERSION" "$C_RESET"
+    hr
+    printf ' 入口：%-34s\n' "$(ingress_desc)"
+    printf ' 出口：%-34s\n' "$(egress_desc)"
+    printf ' 协议：%-16s 端口：%s  分流：%s\n' "$(proto_desc)" "$(st_get PORT 35688)" "$(st_get ROUTE_MODE auto)"
+    printf ' 服务：%s\n' "$(svc_active && echo "${C_G}运行中${C_RESET}" || echo "${C_R}未运行${C_RESET}")"
+    hr
+    printf ' 1. 入口配置      （IPv6直连 / IPv4 NAT / 自有v4中转）\n'
+    printf ' 2. 出口配置      （本机直出 / 指定落地机）\n'
+    printf ' 3. 协议配置      （SS2022 / VLESS Reality / VLESS Enc PQ）\n'
+    printf ' 4. 分流配置      （全部走出口 / 国内直连）\n'
+    printf ' 5. %s应用并重启%s\n' "$C_G" "$C_RESET"
+    printf ' 6. 查看链接与客户端配置\n'
+    printf ' 7. 状态 / 自检 / 放行命令\n'
+    printf ' 8. GEO 数据更新\n'
+    printf ' 9. 备份 / 还原 / 卸载\n'
+    printf '10. 更新脚本\n'
+    printf ' 0. 退出\n'
+    hr
+    ask c '请输入选项 [0-10]' "" >/dev/null
+    case "$c" in
+      1) menu_ingress ;;
+      2) menu_egress ;;
+      3) menu_protocol ;;
+      4) menu_routing ;;
+      5) apply_config && pause ;;
+      6) show_links ;;
+      7) show_status ;;
+      8) geo_update && pause ;;
+      9) menu_backup ;;
+      10) do_selfupdate && pause ;;
+      0) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+mlr v${MLR_VERSION} — Mihomo 中转/落地一键管理
+
+用法：mlr [选项]
+  (无参数)        交互式菜单
+  --info          输出当前入口/出口/链接
+  --status        状态与自检信息
+  --apply         按当前状态重新生成配置并重启
+  --detect        网络环境探测
+  --selftest      配置矩阵自检（需要 mihomo 二进制）
+  --uninstall     卸载
+  --update        更新脚本自身
+  -h, --help      帮助
+
+环境变量：
+  MLR_ETC   配置目录（默认 /etc/mihomo）
+  MLR_BIN   mihomo 路径（默认 /usr/local/bin/mihomo）
+  MLR_DRY   1 = 不触碰系统（调试用）
+EOF
+}
+
+# ------------------------------------------------------------------- 入口 ----
+mkdir -p "$ETC" 2>/dev/null || true
+chmod 700 "$ETC" 2>/dev/null || true
+st_load
+
+case "${1:-}" in
+  --info)      need_root; show_links ;;
+  --status)    need_root; show_status ;;
+  --apply)     need_root; mihomo_ensure && apply_config ;;
+  --detect)    do_detect ;;
+  --selftest)  cmd_selftest ;;
+  --uninstall) need_root; do_uninstall ;;
+  --update)    do_selfupdate ;;
+  -h|--help)   usage ;;
+  "")          need_root; [ -f "$STATE" ] && main_menu || first_run ;;
+  *)           usage; exit 1 ;;
+esac
