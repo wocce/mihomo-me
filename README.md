@@ -24,15 +24,27 @@
 ## 快速开始
 
 ```bash
-# 1) 装到 /usr/local/bin/mlr
-curl -fsSL https://raw.githubusercontent.com/yourname/mihomo-relay/main/install.sh | bash
-# 或仓库内：sudo bash install.sh
+# 一条命令装完并直接进菜单
+curl -fsSL https://raw.githubusercontent.com/yourname/mihomo-relay/main/install.sh | sudo bash
+```
 
-# 2) 跑起来
-sudo mlr
+装完 `mlr` 就是全局命令，以后任何时候敲 `sudo mlr` 即可回到菜单：
+
+```
+ 1. 入口配置      IPv6直连 / IPv4 NAT / 自有v4中转
+ 2. 出口配置      本机直出 / 指定落地机
+ 3. 节点管理      新增/删除/改端口，多协议同机共存
+ 4. 分流配置
+ 5. 应用并重启
+ 6. 查看链接
+ 7. 状态/自检
+ 8. GEO 更新
+ 9. 备份/还原/卸载
+10. 更新脚本
 ```
 
 首次运行会走三步向导：入口 → 出口 → 生成协议并启动。之后每次进主菜单。
+所有修改都是「改完 → 5. 应用并重启」才落盘，中途退出不影响正在跑的服务。
 
 ## 三种入口（决定客户端怎么连进来）
 
@@ -54,7 +66,12 @@ WireGuard 方案是在**本机主动拨出**去连中转机：即使本机只有
 支持落地协议：Shadowsocks(2022)、VLESS Reality、Trojan、VLESS Encryption(PQ)。
 落地机只能走 IPv6 连时，选 `ipver=ipv6`，会强制出站走 AAAA。
 
-## 三种入口协议
+## 三种入站协议（可同机共存）
+
+节点以列表形式管理，新增节点只是往 `listeners` 里追加一段，**绝不覆盖**已有节点。
+同一台机器上可以同时开 SS2022 + Reality + VLESS-Enc PQ，各自独立端口、独立链接。
+同一协议的多个节点共用一套凭据（换密钥会一次影响全部同协议节点）。
+
 
 - **Shadowsocks 2022**（`2022-blake3-aes-256-gcm`）：默认，UDP 全支持，客户端兼容性最好，抗主动探测。
 - **VLESS Reality**：TLS 伪装，`www.microsoft.com` 之类做 SNI，TCP 单栈。
@@ -64,19 +81,6 @@ WireGuard 方案是在**本机主动拨出**去连中转机：即使本机只有
 
 ## 菜单一览
 
-```
- 1. 入口配置      IPv6直连 / IPv4 NAT / 自有v4中转
- 2. 出口配置      本机直出 / 指定落地机
- 3. 协议配置      SS2022 / VLESS Reality / VLESS Enc PQ
- 4. 分流配置      全部走出口 / 国内直连
- 5. 应用并重启    生成 → mihomo -t 校验 → 重启 → 失败自动回滚
- 6. 查看链接      ss:// vless:// + mihomo 客户端 YAML 片段
- 7. 状态/自检     监听、出口 IP、放行命令、最近日志
- 8. GEO 更新
- 9. 备份/还原/卸载
-10. 更新脚本
-```
-
 命令行：
 
 ```bash
@@ -84,7 +88,7 @@ mlr --info       # 打印当前入口/出口/链接
 mlr --status     # 状态与自检
 mlr --apply      # 按当前状态重新生成并重启
 mlr --detect     # 网络环境探测（v6 / 内网 v4 / v4 出网）
-mlr --selftest   # 配置矩阵自检（27 份配置全部过 mihomo -t）
+mlr --selftest   # 配置矩阵自检（33 份配置全部过 mihomo -t）
 mlr --uninstall
 mlr --update
 ```

@@ -44,6 +44,42 @@ need_root() {
 st_get() { printf '%s' "${ST[$1]:-${2:-}}"; }
 st_set() { ST["$1"]="$2"; }
 
+# ---- 多节点（入站）列表：INBOUNDS="ss:35688,reality:443" ----
+inb_list() {
+  local s; s="$(st_get INBOUNDS)"
+  [ -z "$s" ] && s="$(st_get PROTO ss):$(st_get PORT 35688)"
+  printf '%s\n' "$s" | tr ',' '\n' | sed '/^[[:space:]]*$/d'
+}
+inb_count()  { inb_list | wc -l | tr -d ' '; }
+inb_primary(){ inb_list | head -1; }
+# 把「主节点」同步到 PROTO/PORT，供 NAT/中转/状态显示复用
+sync_primary() {
+  local p; p="$(inb_primary)"
+  [ -z "$p" ] && return 0
+  st_set PROTO "${p%%:*}"; st_set PORT "${p##*:}"
+}
+inb_ports() { inb_list | sed 's/.*://' | tr '\n' ' '; }
+inb_add() { # $1=proto $2=port
+  local spec="$1:$2" cur out=""
+  while read -r cur; do
+    [ -z "$cur" ] && continue
+    [ "${cur##*:}" = "$2" ] && { err "端口 $2 已被 ${cur%%:*} 占用"; return 1; }
+    out="${out}${out:+,}$cur"
+  done < <(inb_list)
+  out="${out}${out:+,}$spec"
+  st_set INBOUNDS "$out"; sync_primary; return 0
+}
+inb_del() { # $1=索引(1起)
+  local i=0 cur out=""
+  while read -r cur; do
+    i=$((i+1)); [ -z "$cur" ] && continue
+    [ "$i" = "$1" ] && continue
+    out="${out}${out:+,}$cur"
+  done < <(inb_list)
+  [ -z "$out" ] && { err "至少保留一个节点（可先新增再删除）"; return 1; }
+  st_set INBOUNDS "$out"; sync_primary; return 0
+}
+
 st_load() {
   [ -f "$STATE" ] || return 0
   # 只接受 KEY=VALUE 形式，避免任意代码执行
@@ -298,6 +334,47 @@ listen_socks() {
   fi
 }
 
+# ------------------------------------------------------------ 入站渲染 ----
+# emit_listener <proto> <port> <name> <listen>
+emit_listener() {
+  local p="$1" pt="$2" nm="$3" la="$4"
+  case "$p" in
+    ss)
+      printf '  - name: %s\n' "$nm"
+      printf '    type: shadowsocks\n'
+      printf '    port: %s\n' "$pt"
+      printf '    listen: %s\n' "$(yaml_q "$la")"
+      printf '    cipher: %s\n' "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)"
+      printf '    password: %s\n' "$(yaml_q "$(st_get SS_PASS)")"
+      printf '    udp: true\n'
+      ;;
+    *)
+      printf '  - name: %s\n' "$nm"
+      printf '    type: vless\n'
+      printf '    port: %s\n' "$pt"
+      printf '    listen: %s\n' "$(yaml_q "$la")"
+      printf '    users:\n'
+      printf '      - username: u1\n'
+      printf '        uuid: %s\n' "$(st_get UUID)"
+      if [ "$p" = "reality" ] || [ "$p" = "vlessenc" ]; then
+        printf '        flow: xtls-rprx-vision\n'
+      fi
+      if [ "$p" = "vlessenc" ] && [ -n "$(st_get VENC_SERVER)" ]; then
+        printf '    decryption: %s\n' "$(yaml_q "$(st_get VENC_SERVER)")"
+      fi
+      if { [ "$p" = "reality" ] || [ "$p" = "vlessenc" ]; } && [ -n "$(st_get REALITY_PRIV)" ]; then
+        printf '    reality-config:\n'
+        printf '      dest: %s\n' "$(yaml_q "$(st_get REALITY_DEST www.microsoft.com:443)")"
+        printf '      private-key: %s\n' "$(st_get REALITY_PRIV)"
+        printf '      short-id:\n'
+        printf '        - %s\n' "$(st_get REALITY_SID)"
+        printf '      server-names:\n'
+        printf '        - %s\n' "$(st_get REALITY_SNI www.microsoft.com)"
+      fi
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------- 配置渲染(纯函数) ----
 # render_config <输出文件>   只依赖 ST 与全局变量，方便 selftest 复用
 render_config() {
@@ -352,40 +429,14 @@ render_config() {
       printf '  []\n'
     fi
 
-    # --- 入站 ---
+    # --- 入站（多节点共存，逐个 listeners 追加，互不覆盖）---
     printf '\nlisteners:\n'
-    if [ "$proto" = "ss" ]; then
-      printf '  - name: in-ss\n'
-      printf '    type: shadowsocks\n'
-      printf '    port: %s\n' "$port"
-      printf '    listen: %s\n' "$(yaml_q "$listen_addr")"
-      printf '    cipher: %s\n' "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)"
-      printf '    password: %s\n' "$(yaml_q "$(st_get SS_PASS)")"
-      printf '    udp: true\n'
-    else
-      printf '  - name: in-vless\n'
-      printf '    type: vless\n'
-      printf '    port: %s\n' "$port"
-      printf '    listen: %s\n' "$(yaml_q "$listen_addr")"
-      printf '    users:\n'
-      printf '      - username: u1\n'
-      printf '        uuid: %s\n' "$(st_get UUID)"
-      if [ "$proto" = "reality" ] || [ "$proto" = "vlessenc" ]; then
-        printf '        flow: xtls-rprx-vision\n'
-      fi
-      if [ "$proto" = "vlessenc" ]; then
-        printf '    decryption: %s\n' "$(yaml_q "$(st_get VENC_SERVER)")"
-      fi
-      if [ "$proto" = "reality" ] || [ "$proto" = "vlessenc" ]; then
-        printf '    reality-config:\n'
-        printf '      dest: %s\n' "$(yaml_q "$(st_get REALITY_DEST www.microsoft.com:443)")"
-        printf '      private-key: %s\n' "$(st_get REALITY_PRIV)"
-        printf '      short-id:\n'
-        printf '        - %s\n' "$(st_get REALITY_SID)"
-        printf '      server-names:\n'
-        printf '        - %s\n' "$(st_get REALITY_SNI www.microsoft.com)"
-      fi
-    fi
+    _i=0
+    while read -r _spec; do
+      [ -z "$_spec" ] && continue
+      _i=$((_i+1))
+      emit_listener "${_spec%%:*}" "${_spec##*:}" "in-${_i}-${_spec%%:*}" "$listen_addr"
+    done < <(inb_list)
 
     # --- 分流 ---
     printf '\nrules:\n'
@@ -519,11 +570,29 @@ ingress_desc() {
 }
 
 proto_desc() {
-  case "$(st_get PROTO ss)" in
-    ss)        printf 'Shadowsocks 2022' ;;
-    reality)   printf 'VLESS Reality' ;;
-    vlessenc)  printf 'VLESS Encryption (PQ)' ;;
-    *)         printf '未设置' ;;
+  local n; n="$(inb_count)"
+  local names="" spec
+  while read -r spec; do
+    [ -z "$spec" ] && continue
+    names="${names}${names:+ + }$(_pt_name "${spec%%:*}")"
+  done < <(inb_list)
+  printf '%s 个节点 [%s]' "$n" "$names"
+}
+
+_pt_name() {
+  case "$1" in
+    ss)       printf 'SS2022' ;;
+    reality)  printf 'Reality' ;;
+    vlessenc) printf 'VLESS-Enc' ;;
+    *)        printf '%s' "$1" ;;
+  esac
+}
+
+route_desc() {
+  case "$(st_get ROUTE_MODE auto)" in
+    split)  printf '国内直连' ;;
+    global) printf '全部走出口' ;;
+    *)      printf '全部走出口' ;;
   esac
 }
 
@@ -535,20 +604,31 @@ egress_desc() {
   fi
 }
 
-# 对外可用的「主机:端口」——用于生成客户端链接
-public_endpoint() {
+# 对外主机（链接里的 host 部分）
+public_host() {
   case "$(st_get INGRESS v6)" in
-    v6)    printf '%s %s' "$(st_get V6ADDR)" "$(st_get PORT 35688)" ;;
-    nat)   printf '%s %s' "$(st_get NAT_PUB_IP)" "$(st_get NAT_PUB_PORT)" ;;
-    relay)
-      if [ "$(st_get RELAY_MODE realm)" = "realm" ]; then
-        printf '%s %s' "$(st_get RELAY_HOST)" "$(st_get RELAY_PORT)"
-      else
-        printf '%s %s' "$(st_get RELAY_HOST)" "$(st_get RELAY_PUB_PORT)"
-      fi
-      ;;
-    *) printf '%s %s' "$(st_get V6ADDR)" "$(st_get PORT 35688)" ;;
+    v6)    st_get V6ADDR ;;
+    nat)   st_get NAT_PUB_IP ;;
+    relay) st_get RELAY_HOST ;;
+    *)     st_get V6ADDR ;;
   esac
+}
+
+# 对外端口：NAT/中转 只映射主节点，其余节点用自身端口
+node_pub_port() { # $1=序号(1起) $2=本机端口
+  if [ "$1" = "1" ]; then
+    case "$(st_get INGRESS v6)" in
+      nat)   st_get NAT_PUB_PORT "$2"; return ;;
+      relay)
+        if [ "$(st_get RELAY_MODE realm)" = "realm" ]; then
+          st_get RELAY_PORT "$2"
+        else
+          st_get RELAY_PUB_PORT "$2"
+        fi
+        return ;;
+    esac
+  fi
+  printf '%s' "$2"
 }
 
 # ------------------------------------------------------------ 入口 菜单 ----
@@ -865,42 +945,110 @@ do_landing() {
   ok "落地已记录：$host:$port ($proto)"
 }
 
-# --------------------------------------------------------------- 协议 菜单 ----
-menu_protocol() {
+# --------------------------------------------------------------- 节点 菜单 ----
+node_note() {
+  case "$1" in
+    ss)       printf '%s' "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)" ;;
+    reality)  printf 'SNI=%s' "$(st_get REALITY_SNI www.microsoft.com)" ;;
+    vlessenc) printf 'PQ+Reality SNI=%s' "$(st_get REALITY_SNI www.microsoft.com)" ;;
+  esac
+}
+
+menu_nodes() {
+  local i spec
   while :; do
     clear 2>/dev/null || true
     hr
-    printf '  协议配置   当前：%s   端口：%s\n' "$(proto_desc)" "$(st_get PORT 35688)"
+    printf '  节点管理（多协议可共存，新增不覆盖已有节点）\n'
     hr
-    printf ' 1. Shadowsocks 2022    （兼容性最好，UDP 全支持，推荐先跑通）\n'
-    printf ' 2. VLESS Reality       （TLS 伪装，抗主动探测，TCP 单栈）\n'
-    printf ' 3. VLESS Encryption PQ （后量子加密，需较新客户端）\n'
-    printf ' 4. 修改监听端口\n'
-    printf ' 5. 重新生成该协议的密钥\n'
+    printf '  %-3s %-11s %-7s %s\n' '#' '协议' '端口' '参数'
+    i=0
+    while read -r spec; do
+      [ -z "$spec" ] && continue
+      i=$((i+1))
+      printf '  %-3s %-11s %-7s %s\n' "$i" "$(_pt_name "${spec%%:*}")" "${spec##*:}" "$(node_note "${spec%%:*}")"
+    done < <(inb_list)
+    hr
+    printf ' 1. 新增节点        （选协议与端口，已有节点不受影响）\n'
+    printf ' 2. 删除节点        （按序号，按端口精准删除）\n'
+    printf ' 3. 修改端口        （按序号）\n'
+    printf ' 4. 重新生成密钥    （同一协议的节点共用凭据）\n'
+    printf ' 5. 修改监听地址    （默认 "::" 双栈）\n'
     printf ' 0. 返回\n'
     hr
     ask c '请输入选项' "" >/dev/null
     case "$c" in
-      1) do_proto_ss ;;
-      2) do_proto_reality ;;
-      3) do_proto_vlessenc ;;
-      4) do_port ;;
-      5) do_regen ;;
+      1) do_node_add ;;
+      2) do_node_del ;;
+      3) do_node_port ;;
+      4) do_regen ;;
+      5) do_listen_addr ;;
       0) return ;;
     esac
     st_save
   done
 }
 
-do_port() {
-  local p; p="$(st_get PORT 35688)"
-  ask_port p '监听端口' "$p"
-  if port_in_use "$p"; then warn "端口 $p 已被占用，请确认"; fi
-  st_set PORT "$p"; ok "端口已设为 $p"
+default_port() {
+  case "$1" in
+    ss)       echo 35688 ;;
+    reality)  echo 443 ;;
+    vlessenc) echo 8443 ;;
+    *)        echo 35688 ;;
+  esac
 }
 
-do_proto_ss() {
-  local cipher
+do_node_add() {
+  local proto pt
+  printf ' 1) Shadowsocks 2022  2) VLESS Reality  3) VLESS Encryption(PQ)\n'
+  ask c '协议' 1 >/dev/null
+  case "$c" in
+    2) proto=reality ;;
+    3) proto=vlessenc ;;
+    *) proto=ss ;;
+  esac
+  case "$proto" in
+    ss)       prep_ss ;;
+    reality)  prep_reality ;;
+    vlessenc) prep_vlessenc ;;
+  esac
+  ask_port pt "端口（$(_pt_name "$proto")）" "$(default_port "$proto")"
+  port_in_use "$pt" && warn "端口 $pt 已在本机被占用，确认一下"
+  inb_add "$proto" "$pt" || return 1
+  ok "已新增 $(_pt_name "$proto"):$pt —— 记得「应用并重启」"
+}
+
+do_node_del() {
+  local idx spec
+  [ "$(inb_count)" -le 1 ] && { warn "只剩一个节点，先新增再删"; return 1; }
+  ask idx '要删除的序号' ""
+  [[ "$idx" =~ ^[0-9]+$ ]] || { err "序号无效"; return 1; }
+  spec="$(inb_list | sed -n "${idx}p")"
+  [ -z "$spec" ] && { err "没有第 $idx 个节点"; return 1; }
+  confirm "删除 $(_pt_name "${spec%%:*}") : ${spec##*:} ?" N || return 1
+  inb_del "$idx" && ok "已删除"
+}
+
+do_node_port() {
+  local idx spec np
+  ask idx '要改端口的序号' "1"
+  [[ "$idx" =~ ^[0-9]+$ ]] || { err "序号无效"; return 1; }
+  spec="$(inb_list | sed -n "${idx}p")"
+  [ -z "$spec" ] && { err "没有第 $idx 个节点"; return 1; }
+  ask_port np '新端口' "${spec##*:}"
+  st_set INBOUNDS "$(inb_list | sed "${idx}s/.*/${spec%%:*}:${np}/")"
+  sync_primary
+  ok "端口已改为 $np"
+}
+
+do_listen_addr() {
+  local a; ask a '监听地址（:: 双栈 / 0.0.0.0 仅 v4 / 指定 IP）' "$(st_get LISTEN_ADDR ::)"
+  [ -z "$a" ] && return 1
+  st_set LISTEN_ADDR "$a"; ok "监听地址：$a"
+}
+
+prep_ss() {
+  local cipher p
   printf ' 1) 2022-blake3-aes-256-gcm（推荐） 2) 2022-blake3-aes-128-gcm 3) aes-256-gcm(旧)\n'
   ask c '请输入选项' 1 >/dev/null
   case "$c" in
@@ -908,7 +1056,6 @@ do_proto_ss() {
     3) cipher=aes-256-gcm ;;
     *) cipher=2022-blake3-aes-256-gcm ;;
   esac
-  st_set PROTO ss
   st_set SS_CIPHER "$cipher"
   if [ "$(st_get SS_CIPHER_SAVED)" != "$cipher" ] || [ -z "$(st_get SS_PASS)" ]; then
     if [[ "$cipher" == 2022-* ]]; then
@@ -920,37 +1067,35 @@ do_proto_ss() {
     fi
     st_set SS_CIPHER_SAVED "$cipher"
   fi
-  ok "Shadowsocks 已就绪：$cipher"
+  ok "Shadowsocks 参数就绪：$cipher"
 }
 
-do_proto_reality() {
-  local sni dest
-  ask sni '伪装域名 SNI（建议微软件的 www.microsoft.com）' "$(st_get REALITY_SNI www.microsoft.com)"
-  dest="$(st_get REALITY_DEST "$sni:443")"
-  st_set PROTO reality
-  st_set REALITY_SNI "$sni"; st_set REALITY_DEST "$dest"
-  [ -z "$(st_get UUID)" ] && st_set UUID "$(gen_uuid)"
-  if [ -z "$(st_get REALITY_PRIV)" ] || [ -z "$(st_get REALITY_PUB)" ]; then gen_reality; fi
-  ok "VLESS Reality 已就绪：SNI=$sni"
-}
-
-do_proto_vlessenc() {
+prep_reality() {
   local sni
-  ask sni '伪装域名 SNI' "$(st_get REALITY_SNI www.microsoft.com)"
-  st_set PROTO vlessenc
+  ask sni '伪装域名 SNI（建议 www.microsoft.com）' "$(st_get REALITY_SNI www.microsoft.com)"
   st_set REALITY_SNI "$sni"; st_set REALITY_DEST "$(st_get REALITY_DEST "$sni:443")"
   [ -z "$(st_get UUID)" ] && st_set UUID "$(gen_uuid)"
-  [ -z "$(st_get REALITY_PRIV)" ] && gen_reality
+  { [ -z "$(st_get REALITY_PRIV)" ] || [ -z "$(st_get REALITY_PUB)" ]; } && gen_reality
+  ok "VLESS Reality 参数就绪：SNI=$sni"
+}
+
+prep_vlessenc() {
+  prep_reality
   [ -z "$(st_get VENC_SERVER)" ] && gen_vlessenc
-  ok "VLESS Encryption (PQ) 已就绪"
+  ok "VLESS Encryption (PQ) 参数就绪"
 }
 
 do_regen() {
-  case "$(st_get PROTO ss)" in
-    ss) st_set SS_PASS "$(gen_ss_pass "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)")"; ok "SS 密码已重生成" ;;
-    reality) gen_reality; st_set UUID "$(gen_uuid)"; ok "Reality 密钥/UUID 已重生成" ;;
-    vlessenc) gen_reality; gen_vlessenc; st_set UUID "$(gen_uuid)"; ok "PQ 参数已重生成" ;;
-  esac
+  local spec
+  while read -r spec; do
+    [ -z "$spec" ] && continue
+    case "${spec%%:*}" in
+      ss)       st_set SS_PASS "$(gen_ss_pass "$(st_get SS_CIPHER 2022-blake3-aes-256-gcm)")" ;;
+      reality)  gen_reality; st_set UUID "$(gen_uuid)" ;;
+      vlessenc) gen_reality; gen_vlessenc; st_set UUID "$(gen_uuid)" ;;
+    esac
+  done < <(inb_list)
+  ok "密钥已重新生成（同协议节点同步生效，客户端需重新导入）"
 }
 
 menu_routing() {
@@ -974,54 +1119,85 @@ b64url() { base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '='; }
 urlenc() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/?/%3F/g' -e 's/#/%23/g' -e 's/&/%26/g' -e 's/=/%3D/g' -e 's/+/%2B/g'; }
 
 # ------------------------------------------------------- 链接 / 客户端配置 ----
+# 单节点：分享链接
+print_link() { # <proto> <host> <port> <remark>
+  local p="$1" h="$2" pt="$3" rm="$4"
+  case "$p" in
+    ss)
+      printf '\n# Shadowsocks 链接（%s）\n' "$pt"
+      printf 'ss://%s@%s:%s#%s\n' \
+        "$(printf '%s:%s' "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" | b64url)" \
+        "$h" "$pt" "$rm"
+      ;;
+    reality)
+      printf '\n# VLESS Reality 链接（%s）\n' "$pt"
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$(st_get UUID)" "$h" "$pt" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$rm"
+      ;;
+    vlessenc)
+      printf '\n# VLESS Encryption (PQ) 链接（%s）\n' "$pt"
+      printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
+        "$(st_get UUID)" "$h" "$pt" "$(urlenc "$(st_get VENC_CLIENT)")" \
+        "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$rm"
+      ;;
+  esac
+}
+
+# 单节点：mihomo 客户端 proxies 片段
+print_client_proxy() { # <proto> <host> <port> <remark>
+  local p="$1" h="$2" pt="$3" rm="$4"
+  case "$p" in
+    ss)
+      printf '  - name: "%s"\n    type: ss\n    server: %s\n    port: %s\n    cipher: %s\n    password: "%s"\n    udp: true\n' \
+        "$rm" "$h" "$pt" "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" ;;
+    reality)
+      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
+        "$rm" "$h" "$pt" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
+    vlessenc)
+      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    encryption: "%s"\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
+        "$rm" "$h" "$pt" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get VENC_CLIENT)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
+  esac
+}
+
 show_links() {
-  local host port remark
-  read -r host port <<<"$(public_endpoint)"
-  [ -z "${host:-}" ] && { warn "还没配置入口，先跑一遍「1. 入口」"; pause; return; }
-  remark="mlr-$(st_get PROTO ss)-$(st_get INGRESS v6)"
+  local host i spec p pt pp rm
+  host="$(public_host)"
+  [ -z "$host" ] && { warn "还没配置入口，先跑一遍「1. 入口」"; pause; return; }
 
   hr
   printf '  服务端：%s  →  %s\n' "$(ingress_desc)" "$(egress_desc)"
-  printf '  对外地址：%s:%s\n' "$host" "$port"
+  printf '  对外主机：%s   节点数：%s\n' "$host" "$(inb_count)"
   hr
 
-  case "$(st_get PROTO ss)" in
-    ss)
-      printf '\n# Shadowsocks 链接\n'
-      printf 'ss://%s@%s:%s#%s\n' \
-        "$(printf '%s:%s' "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" | b64url)" \
-        "$host" "$port" "$remark"
-      ;;
-    reality)
-      printf '\n# VLESS Reality 链接\n'
-      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$(st_get UUID)" "$host" "$port" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$remark"
-      ;;
-    vlessenc)
-      printf '\n# VLESS Encryption (PQ) 链接\n'
-      printf 'vless://%s@%s:%s?encryption=%s&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&flow=xtls-rprx-vision#%s\n' \
-        "$(st_get UUID)" "$host" "$port" "$(urlenc "$(st_get VENC_CLIENT)")" \
-        "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" "$remark"
-      ;;
-  esac
+  printf '\n# ------------------- 分享链接 -------------------\n'
+  i=0
+  while read -r spec; do
+    [ -z "$spec" ] && continue
+    i=$((i+1)); p="${spec%%:*}"; pt="${spec##*:}"
+    pp="$(node_pub_port "$i" "$pt")"
+    rm="mlr-$(_pt_name "$p")-$pp"
+    print_link "$p" "$host" "$pp" "$rm"
+  done < <(inb_list)
 
-  printf '\n# mihomo / Clash.Meta 客户端片段（直接粘到 proxies 下）\n'
-  case "$(st_get PROTO ss)" in
-    ss)
-      printf '  - name: "%s"\n    type: ss\n    server: %s\n    port: %s\n    cipher: %s\n    password: "%s"\n    udp: true\n' \
-        "$remark" "$host" "$port" "$(st_get SS_CIPHER)" "$(st_get SS_PASS)" ;;
-    reality)
-      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
-        "$remark" "$host" "$port" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
-    vlessenc)
-      printf '  - name: "%s"\n    type: vless\n    server: %s\n    port: %s\n    uuid: %s\n    flow: xtls-rprx-vision\n    tls: true\n    servername: %s\n    client-fingerprint: chrome\n    encryption: "%s"\n    reality-opts:\n      public-key: %s\n      short-id: %s\n    udp: true\n' \
-        "$remark" "$host" "$port" "$(st_get UUID)" "$(st_get REALITY_SNI)" "$(st_get VENC_CLIENT)" "$(st_get REALITY_PUB)" "$(st_get REALITY_SID)" ;;
-  esac
+  printf '\n\n# ------- mihomo / Clash.Meta 客户端片段（粘到 proxies 下）-------\n'
+  i=0
+  while read -r spec; do
+    [ -z "$spec" ] && continue
+    i=$((i+1)); p="${spec%%:*}"; pt="${spec##*:}"
+    pp="$(node_pub_port "$i" "$pt")"
+    rm="mlr-$(_pt_name "$p")-$pp"
+    print_client_proxy "$p" "$host" "$pp" "$rm"
+  done < <(inb_list)
+
   hr
+  if [ "$(st_get INGRESS v6)" = "nat" ] || [ "$(st_get INGRESS v6)" = "relay" ]; then
+    warn "NAT/中转 模式下只有「第 1 个节点」做了端口映射，其余端口需在商家面板/中转机上另行映射"
+  fi
   [ "$(st_get EGRESS_MODE local)" = "landing" ] && \
-    info "落地机若也用本脚本，把上面这段反向填到落地机的「2. 指定落地机」里即可"
+    info "落地机若也用本脚本，把上面片段反向填到落地机的「2. 指定落地机」里即可"
   pause
 }
+
 
 # ---------------------------------------------------------------- 状态/自检 ----
 show_status() {
@@ -1112,7 +1288,7 @@ cmd_selftest() {
   for p in "${protos[@]}"; do
     for e in "${egresses[@]}"; do
       for r in "${routes[@]}"; do
-        st_set PROTO "$p"; st_set ROUTE_MODE "$r"; st_set LISTEN_ADDR '::'
+        st_set INBOUNDS "$p:35688"; sync_primary; st_set ROUTE_MODE "$r"; st_set LISTEN_ADDR '::'
         case "$e" in
           local) st_set EGRESS_MODE local ;;
           landing_ss)
@@ -1136,7 +1312,7 @@ cmd_selftest() {
       done
     done
     # 监听地址变体
-    st_set PROTO "$p"; st_set ROUTE_MODE global; st_set EGRESS_MODE local
+    st_set INBOUNDS "$p:35688"; sync_primary; st_set ROUTE_MODE global; st_set EGRESS_MODE local
     for l in "${listens[@]}"; do
       st_set LISTEN_ADDR "$l"
       render_config "$work/cfg.yaml"
@@ -1150,6 +1326,34 @@ cmd_selftest() {
   done
 
   st_set LISTEN_ADDR '::'
+
+  # 多节点共存（一台机器上 4 种协议同时监听）
+  local multi_combo
+  for multi_combo in \
+      "ss:35688,reality:443,vlessenc:8443" \
+      "ss:35688,ss:35689" \
+      "reality:443,vlessenc:8443"; do
+    st_set INBOUNDS "$multi_combo"; sync_primary
+    for e in local landing_ss; do
+      if [ "$e" = "local" ]; then
+        st_set EGRESS_MODE local
+      else
+        st_set EGRESS_MODE landing; st_set LANDING_PROTO ss
+        st_set LANDING_HOST 203.0.113.10; st_set LANDING_PORT 35688
+        st_set LANDING_CIPHER 2022-blake3-aes-256-gcm
+        st_set LANDING_PASS "$(st_get SS_PASS)"
+      fi
+      render_config "$work/cfg.yaml"
+      if "$BIN" -t -d "$work" -f "$work/cfg.yaml" >"$work/out.log" 2>&1; then
+        pass=$((pass+1))
+      else
+        fail=$((fail+1)); err "FAIL  multi=$multi_combo egress=$e"
+        sed -n '1,8p' "$work/out.log" | sed 's/^/        /'
+      fi
+    done
+  done
+  st_set INBOUNDS "ss:35688"; st_set EGRESS_MODE local; sync_primary
+
   hr
   printf ' 自检结果：通过 %s / 失败 %s\n' "$pass" "$fail"
   hr
@@ -1183,7 +1387,9 @@ first_run() {
   hr
   mihomo_ensure || return 1
   do_ingress_v6
-  st_set PROTO ss
+  prep_ss
+  inb_add ss "$(default_port ss)" || st_set INBOUNDS "ss:$(default_port ss)"
+  sync_primary
   ask c '出口：1) 本机直出  2) 有落地机' 1 >/dev/null
   if [ "$c" = "2" ]; then do_landing; else st_set EGRESS_MODE local; fi
   st_save
@@ -1198,12 +1404,12 @@ main_menu() {
     hr
     printf ' 入口：%-34s\n' "$(ingress_desc)"
     printf ' 出口：%-34s\n' "$(egress_desc)"
-    printf ' 协议：%-16s 端口：%s  分流：%s\n' "$(proto_desc)" "$(st_get PORT 35688)" "$(st_get ROUTE_MODE auto)"
+    printf ' 协议：%-16s 端口：%s  分流：%s\n' "$(proto_desc)" "$(st_get PORT 35688)" "$(route_desc)"
     printf ' 服务：%s\n' "$(svc_active && echo "${C_G}运行中${C_RESET}" || echo "${C_R}未运行${C_RESET}")"
     hr
     printf ' 1. 入口配置      （IPv6直连 / IPv4 NAT / 自有v4中转）\n'
     printf ' 2. 出口配置      （本机直出 / 指定落地机）\n'
-    printf ' 3. 协议配置      （SS2022 / VLESS Reality / VLESS Enc PQ）\n'
+    printf ' 3. 节点管理      （多协议共存：SS2022 / Reality / VLESS-Enc PQ）\n'
     printf ' 4. 分流配置      （全部走出口 / 国内直连）\n'
     printf ' 5. %s应用并重启%s\n' "$C_G" "$C_RESET"
     printf ' 6. 查看链接与客户端配置\n'
@@ -1217,7 +1423,7 @@ main_menu() {
     case "$c" in
       1) menu_ingress ;;
       2) menu_egress ;;
-      3) menu_protocol ;;
+      3) menu_nodes ;;
       4) menu_routing ;;
       5) apply_config && pause ;;
       6) show_links ;;
